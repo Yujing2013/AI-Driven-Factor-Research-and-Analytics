@@ -13,6 +13,7 @@ sys.path.append(os.path.abspath("."))  # 确保能 import 到本地 gplearn 包
 from gplearn.genetic import SymbolicRegressor
 from gplearn.functions import ts_lag1, ts_mean5, ts_mean10, cs_rank_pct
 from gplearn.functions import set_function_context, build_context_from_index
+from gplearn.fitness import make_fitness
 
 # ===== 新增：引入特征模块 =====
 from features_pv import build_features, FEATURE_COLS
@@ -26,7 +27,7 @@ df = df.sort_index()
 
 # 目标：下二十日收益 ret_fwd1
 close = df['close'].unstack('ts_code').sort_index()
-ret_fwd1 = (close.shift(-20) / close - 1.0).stack().rename('ret_fwd1')
+ret_fwd1 = (close.shift(-2) / close - 1.0).stack().rename('ret_fwd1')
 df = df.join(ret_fwd1, how='left').dropna(subset=['ret_fwd1'])
 
 # 可选稳健化：裁剪极端收益，防止极少数异常影响训练
@@ -78,15 +79,15 @@ df = df.dropna(subset=feature_cols + ['ret_fwd1'])
 dates = df.index.get_level_values(0).astype(str)
 
 train_mask = pd.Series(
-    (dates >= "20150101") & (dates <= "20160101"),
+    (dates >= "20150101") & (dates <= "20180601"),
     index=df.index
 )
 valid_mask = pd.Series(
-    (dates >= "20160302") & (dates <= "20160930"),
+    (dates >= "20190302") & (dates <= "20200302"),
     index=df.index
 )
 test_mask = pd.Series(
-    (dates >= "20161001") & (dates <= "20170131"),
+    (dates >= "20200320") & (dates <= "20210320"),
     index=df.index
 )
 
@@ -119,53 +120,147 @@ w_train = day_uniform_weights(train_mask)
 w_valid = day_uniform_weights(valid_mask)
 w_test  = day_uniform_weights(test_mask)
 
+# ====== 逐日(IC/RankIC) fitness（严格口径；带号均值；无绝对值无裁剪） ======
+from gplearn.fitness import make_fitness
+from scipy.stats import spearmanr, pearsonr
+
+# 选择训练目标：'rank' = RankIC(逐日Spearman)；'pearson' = IC(逐日Pearson)
+FITNESS_KIND = 'pearson'    # ← 需要IC就改成 'pearson'
+
+# 预缓存：把“训练期 MultiIndex”拆成按日片段，避免每次 groupby
+_train_groups = None
+_train_index_for_metric = None
+
+def _prepare_groups(mi: pd.MultiIndex):
+    days = mi.get_level_values(0).to_numpy()
+    pos = []; s = 0
+    for i in range(1, len(days)+1):
+        if i == len(days) or days[i] != days[s]:
+            pos.append((s, i))  # 半开区间
+            s = i
+    return pos
+
+def set_train_index_for_metric(mi):
+    global _train_index_for_metric, _train_groups
+    _train_index_for_metric = mi
+    _train_groups = _prepare_groups(mi)
+
+def _fitness_daily_corr_numpy(y_true, y_pred, sample_weight):
+    """
+    严格口径：逐日计算 RankIC(或IC)；不满足条件的当日记 0；最后取“带号均值”。
+    退化直接 0：整体std≈0；或>50%交易日记0。
+    """
+    import numpy as np
+    if _train_groups is None:
+        return 0.0
+
+    y = np.asarray(y_true); h = np.asarray(y_pred)
+
+    # 整体近常数 → 0
+    if not np.isfinite(h).any() or np.nanstd(h) < 1e-8:
+        return 0.0
+
+    scores = []
+    zero_days = 0
+    for (s, t) in _train_groups:
+        yy = y[s:t]; hh = h[s:t]
+        m = np.isfinite(yy) & np.isfinite(hh)
+        if m.sum() < 50:  # 最少截面样本
+            scores.append(0.0); zero_days += 1; continue
+        yy = yy[m]; hh = hh[m]
+
+        nunq = len(np.unique(hh))
+        uniq_ratio = nunq / len(hh)
+        # 横截面退化：预测几乎无区分度；或真实/预测唯一值太少
+        if uniq_ratio < 0.05 or np.nanstd(hh) < 1e-8 or len(np.unique(yy)) < 3 or nunq < 3:
+            scores.append(0.0); zero_days += 1; continue
+
+        if FITNESS_KIND == 'rank':
+            r = spearmanr(yy, hh).statistic
+        else:  # 'pearson'
+            r = pearsonr(yy, hh).statistic
+        if r is None or not np.isfinite(r):
+            r = 0.0; zero_days += 1
+        scores.append(float(r))
+
+    total_days = len(_train_groups)
+    if total_days == 0 or (zero_days / total_days) > 0.5:
+        return 0.0
+
+    return float(np.mean(scores))  # 带号均值（不取绝对值、不裁剪）
+
+fitness_gp = make_fitness(function=_fitness_daily_corr_numpy, greater_is_better=True)
+
+# ===== 评估工具（VALID/TEST 也用严格口径；方向不取正） =====
+def _make_groups(mi: pd.MultiIndex):
+    days = mi.get_level_values(0).to_numpy()
+    pos = []; s = 0
+    for i in range(1, len(days)+1):
+        if i == len(days) or days[i] != days[s]:
+            pos.append((s, i)); s = i
+    return pos
+
+def _daily_mean_corr(index, y_true, y_pred, kind='rank'):
+    import numpy as np
+    from scipy.stats import spearmanr, pearsonr
+    groups = _make_groups(index)
+    y = np.asarray(y_true); h = np.asarray(y_pred)
+    if not np.isfinite(h).any() or np.nanstd(h) < 1e-8:
+        return 0.0
+    vals = []
+    for (s, t) in groups:
+        yy = y[s:t]; hh = h[s:t]
+        m = np.isfinite(yy) & np.isfinite(hh)
+        if m.sum() < 50:
+            vals.append(0.0); continue
+        yy = yy[m]; hh = hh[m]
+        nunq = len(np.unique(hh)); uniq_ratio = nunq / len(hh)
+        if uniq_ratio < 0.05 or np.nanstd(hh) < 1e-8 or len(np.unique(yy)) < 3 or nunq < 3:
+            vals.append(0.0); continue
+        if kind == 'rank':
+            r = spearmanr(yy, hh).statistic
+        else:
+            r = pearsonr(yy, hh).statistic
+        if r is None or not np.isfinite(r): r = 0.0
+        vals.append(float(r))
+    return float(np.mean(vals)) if vals else 0.0
+
+
 func_set = (
     'add','sub','mul','div','log','sqrt','abs','neg','max','min',
     ts_lag1, ts_mean5, ts_mean10, cs_rank_pct
 )
 
 # ===================== 配置 & 训练 GP（以 Spearman/IC 为目标） =====================
-# est = SymbolicRegressor(
-#     population_size=1200,
-#     generations=5,
-#     tournament_size=40,
-#     function_set=('add','sub','mul','div','log','sqrt','abs','neg','max','min'),
-#     metric='spearman',                # 选股/排序友好
-#     parsimony_coefficient='auto',     # 自适应简约惩罚，抑制膨胀
-#     p_crossover=0.85,
-#     p_subtree_mutation=0.06,
-#     p_hoist_mutation=0.02,
-#     p_point_mutation=0.05,
-#     max_samples=0.7,                  # 袋外评估 + 加速
-#     n_jobs=-1,
-#     random_state=37,
-#     verbose=1,
-#     stopping_criteria=0.2   # ← 关键：禁止0.0触发的提前停止
-# )
+
+# 在创建 SymbolicRegressor 之前
+set_train_index_for_metric(df.loc[train_mask].index)
+
 est = SymbolicRegressor(
     population_size=1000,
     generations=2,
-    tournament_size=40,
+    tournament_size=20,
     function_set=func_set,
-    metric='spearman',
+    metric=fitness_gp,            # ← 使用新的 IC/RankIC fitness
     parsimony_coefficient='auto',
-    p_crossover=0.85,
-    p_subtree_mutation=0.06,
+    # parsimony_coefficient=0.01,
+    p_crossover=0.4,
+    p_subtree_mutation=0.01,
     p_hoist_mutation=0.02,
-    p_point_mutation=0.05,
-    max_samples=1.0,   # 必须（保证截面完整）
-    n_jobs=1,          # 必须（上下文为进程内全局）
-    random_state=37,
+    p_point_mutation=0.01,
+    p_point_replace = 0.4,
+    max_samples=1.0,
+    n_jobs=1,                     # 为了上下文一致性必须=1
+    random_state=24,
     verbose=1,
-    stopping_criteria=0.2
+    stopping_criteria=0.20
 )
 
-# 训练
+
+# 训练前设置“训练期”的函数上下文（你已有）
 est.set_context_index(df.loc[train_mask].index)
 est.fit(X_train, y_train, sample_weight=w_train)
 
-
-# est.fit(X_train, y_train, sample_weight=w_train)
 
 # ===================== Factor Zoo：输出前10名程序（按 fitness_ 排序） =====================
 def get_topk_programs(est, topk=10):
@@ -199,11 +294,96 @@ def get_topk_programs(est, topk=10):
 
 topk_programs = get_topk_programs(est, topk=10)
 
-print("\n[Top 10 Factors by GP fitness]  (fitness_ includes parsimony penalty)")
+# ===== 基准索引（后面多处会用） =====
+valid_index = df.loc[valid_mask].index
+test_index  = df.loc[test_mask].index
+
+# ==== 语义去重 + 过滤单变量伪复杂（仅用于报告/评估；不影响训练） ====
+def _program_output(index, prog, X):
+    set_function_context(build_context_from_index(index))
+    return prog.execute(X)
+
+def _dedup_and_filter(programs, X_ref, index_ref, feature_cols, X_sample_cols=None,
+                      corr_tol=0.999, min_length=1):
+    import numpy as np
+    from scipy.stats import pearsonr
+
+    kept = []
+    kept_vals = []
+    if X_sample_cols is None:
+        X_sample_cols = np.arange(min(len(feature_cols), 12))
+    X_feat_ref = X_ref[:, X_sample_cols]
+
+    for p in programs:
+        if getattr(p, 'length_', 0) < min_length:
+            continue
+        yhat = _program_output(index_ref, p, X_ref)
+
+        # 与已保留因子语义去重
+        is_dup = False
+        for v in kept_vals:
+            m = np.isfinite(v) & np.isfinite(yhat)
+            if m.sum() < 50:
+                continue
+            r = pearsonr(v[m], yhat[m]).statistic
+            if r is not None and np.isfinite(r) and abs(r) > corr_tol:
+                is_dup = True
+                break
+        if is_dup:
+            continue
+
+        # 与原始特征过高相关（≈单变量）
+        looks_univariate = False
+        for j in range(X_feat_ref.shape[1]):
+            col = X_feat_ref[:, j]
+            m = np.isfinite(col) & np.isfinite(yhat)
+            if m.sum() < 50:
+                continue
+            r = pearsonr(col[m], yhat[m]).statistic
+            if r is not None and np.isfinite(r) and abs(r) > corr_tol:
+                looks_univariate = True
+                break
+
+        kept.append((p, looks_univariate))
+        kept_vals.append(yhat)
+
+    return kept
+
+# 用 VALID 作为参考集做语义去重/过滤
+progs_tagged = _dedup_and_filter(topk_programs, X_valid, valid_index, feature_cols,
+                                 X_sample_cols=None, corr_tol=0.999, min_length=1)
+
+progs_nonuni = [p for (p, flag) in progs_tagged if not flag]
+progs_uni    = [p for (p, flag) in progs_tagged if flag]
+topk_programs = (progs_nonuni + progs_uni)[:10]
+
+# ===== VALID/TEST 打印（简洁规范） =====
+# 先算整体（用当前最优 program）
+est.set_context_index(valid_index)
+yhat_valid = est.predict(X_valid)
+est.set_context_index(test_index)
+yhat_test  = est.predict(X_test)
+
+print("\n# ==== Overall (on current best) ====")
+print(f"RankIC  VALID={_daily_mean_corr(valid_index, y_valid, yhat_valid, 'rank'):+.4f}   "
+      f"TEST={_daily_mean_corr(test_index,  y_test,  yhat_test,  'rank'):+.4f}")
+print(f"IC      VALID={_daily_mean_corr(valid_index, y_valid, yhat_valid, 'pearson'):+.4f}   "
+      f"TEST={_daily_mean_corr(test_index,  y_test,  yhat_test,  'pearson'):+.4f}")
+
+print("\n# ==== Top Programs: VALID / TEST (RankIC & IC, signed means) ====")
 for i, p in enumerate(topk_programs, 1):
-    raw = getattr(p, "raw_fitness_", float("nan"))  # 某些版本可能没有 raw_fitness_
-    print(f"#{i:02d}  fitness={p.fitness_:.6f}  raw={raw:.6f}  "
-          f"length={getattr(p, 'length_', -1):>3}  depth={getattr(p, 'depth_', -1):>2}  :: {p}")
+    # VALID
+    set_function_context(build_context_from_index(valid_index))
+    yv = p.execute(X_valid)
+    ric_v = _daily_mean_corr(valid_index, y_valid, yv,  kind='rank')
+    ic_v  = _daily_mean_corr(valid_index, y_valid, yv,  kind='pearson')
+    # TEST
+    set_function_context(build_context_from_index(test_index))
+    yt = p.execute(X_test)
+    ric_t = _daily_mean_corr(test_index,  y_test,  yt, kind='rank')
+    ic_t  = _daily_mean_corr(test_index,  y_test,  yt, kind='pearson')
+
+    print(f"#{i:02d}  RankIC[V,T]={ric_v:+.4f}, {ric_t:+.4f}   IC[V,T]={ic_v:+.4f}, {ic_t:+.4f}   :: {p}")
 
 
 # ===================== 评估：整体 IC & 日度 IC =====================
@@ -222,46 +402,42 @@ yhat_valid = est.predict(X_valid)
 est.set_context_index(df.loc[test_mask].index)
 yhat_test  = est.predict(X_test)
 
-print(f"[VALID] IC(spearman) = {ic_spearman(y_valid, yhat_valid):.4f}")
-print(f"[TEST ] IC(spearman) = {ic_spearman(y_test,  yhat_test):.4f}")
-
 # ===================== 给前10因子分别算 VALID/TEST 的 RankIC =====================
-# def _ic_for_programs(programs, X_valid, y_valid, X_test, y_test):
-#     print("\n[Top 10 Factors: VALID/TEST IC]")
-#     for i, p in enumerate(programs, 1):
-#         # 直接用 Program.execute(X) 计算该因子的打分
-#         yv = p.execute(X_valid)
-#         yt = p.execute(X_test)
-#         icv = ic_spearman(y_valid, yv)
-#         ict = ic_spearman(y_test,  yt)
-#         print(f"#{i:02d}  VALID_IC={icv:.4f}  TEST_IC={ict:.4f}")
 
-# _ic_for_programs(topk_programs, X_valid, y_valid, X_test, y_test)
+# ---- 评估工具（VALID/TEST 也走严格口径；方向不取正） ----
+# ===== 评估工具（VALID/TEST 也用严格口径；方向不取正） =====
 
+# ===== VALID/TEST 打印（简洁规范） =====
+# 先算整体（用当前最优 program）
+est.set_context_index(df.loc[valid_mask].index)
+yhat_valid = est.predict(X_valid)
+est.set_context_index(df.loc[test_mask].index)
+yhat_test  = est.predict(X_test)
 
-def _ic_for_programs(programs, X_valid, y_valid, X_test, y_test,
-                     index_valid, index_test):
-    print("\n[Top 10 Factors: VALID/TEST IC]")
-    for i, p in enumerate(programs, 1):
-        # —— VALID：先设验证集上下文，再执行
-        set_function_context(build_context_from_index(index_valid))
-        yv = p.execute(X_valid)
-        icv = ic_spearman(y_valid, yv)
+print("\n# ==== Overall (on current best) ====")
+print(f"RankIC  VALID={_daily_mean_corr(df.loc[valid_mask].index, y_valid, yhat_valid, 'rank'):+.4f}   "
+      f"TEST={_daily_mean_corr(df.loc[test_mask].index,  y_test,  yhat_test,  'rank'):+.4f}")
+print(f"IC      VALID={_daily_mean_corr(df.loc[valid_mask].index, y_valid, yhat_valid, 'pearson'):+.4f}   "
+      f"TEST={_daily_mean_corr(df.loc[test_mask].index,  y_test,  yhat_test,  'pearson'):+.4f}")
 
-        # —— TEST：切到测试集上下文，再执行
-        set_function_context(build_context_from_index(index_test))
-        yt = p.execute(X_test)
-        ict = ic_spearman(y_test, yt)
+# 逐因子（TopK）打印
+print("\n# ==== Top Programs: VALID / TEST (RankIC & IC, signed means) ====")
+valid_index = df.loc[valid_mask].index
+test_index  = df.loc[test_mask].index
 
-        print(f"#{i:02d}  VALID_IC={icv:.4f}  TEST_IC={ict:.4f}")
+for i, p in enumerate(topk_programs, 1):
+    # VALID
+    set_function_context(build_context_from_index(valid_index))
+    yv = p.execute(X_valid)
+    ric_v = _daily_mean_corr(valid_index, y_valid, yv,  kind='rank')
+    ic_v  = _daily_mean_corr(valid_index, y_valid, yv,  kind='pearson')
+    # TEST
+    set_function_context(build_context_from_index(test_index))
+    yt = p.execute(X_test)
+    ric_t = _daily_mean_corr(test_index,  y_test,  yt, kind='rank')
+    ic_t  = _daily_mean_corr(test_index,  y_test,  yt, kind='pearson')
 
-_ic_for_programs(
-    topk_programs,
-    X_valid, y_valid,
-    X_test,  y_test,
-    df.loc[valid_mask].index,
-    df.loc[test_mask].index
-)
+    print(f"#{i:02d}  RankIC[V,T]={ric_v:+.4f}, {ric_t:+.4f}   IC[V,T]={ic_v:+.4f}, {ic_t:+.4f}   :: {p}")
 
 
 

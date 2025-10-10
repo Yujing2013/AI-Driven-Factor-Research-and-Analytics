@@ -242,6 +242,74 @@ def _ts_mean_w(x: np.ndarray, w: int) -> np.ndarray:
 def _ts_mean5(x):  return _ts_mean_w(x, 5)
 def _ts_mean10(x): return _ts_mean_w(x, 10)
 
+# Temporal difference (first-order difference)
+def _ts_diff1(x: np.ndarray) -> np.ndarray:
+    ctx = _FUNCTION_CONTEXT
+    if ctx is None:
+        return np.zeros_like(x, dtype=np.float64)
+    out = np.full_like(x, np.nan, dtype=np.float64)
+    idx = ctx.prev_index
+    valid = idx >= 0
+    out[valid] = x[valid] - x[idx[valid]]
+    return out
+
+# Time-series standard deviation (sliding window)
+def _ts_std_w(x: np.ndarray, w: int) -> np.ndarray:
+    ctx = _FUNCTION_CONTEXT
+    if ctx is None:
+        return np.zeros_like(x, dtype=np.float64)
+    
+    #    Time-series standard deviation (sliding window)            
+    mean = _ts_mean_w(x, w)
+    
+    # Moving average of squared differences
+    x_sq = (x - mean) **2
+    acc_sq = np.nan_to_num(x_sq, nan=0.0).astype(np.float64).copy()
+    cnt_sq = (~np.isnan(x_sq)).astype(np.float64)
+    idx = ctx.prev_index.copy()
+    
+    for _ in range(1, w):
+        valid = idx >= 0
+        if not np.any(valid):
+            break
+        xv = x_sq[idx[valid]]
+        acc_sq[valid] += np.nan_to_num(xv, nan=0.0)
+        cnt_sq[valid] += (~np.isnan(xv)).astype(np.float64)
+        idx[valid] = ctx.prev_index[idx[valid]]
+        idx[~valid] = -1
+    
+    var = acc_sq / (cnt_sq + 1e-12)
+    var[cnt_sq == 0] = np.nan
+    return np.sqrt(var)
+
+# Window standard deviation shortcut function
+def _ts_std5(x): return _ts_std_w(x, 5)
+def _ts_std10(x): return _ts_std_w(x, 10)
+
+# Time series accumulation
+def _ts_cumsum(x: np.ndarray) -> np.ndarray:
+    ctx = _FUNCTION_CONTEXT
+    if ctx is None:
+        return np.zeros_like(x, dtype=np.float64)
+    
+    n = ctx.n
+    out = np.full_like(x, np.nan, dtype=np.float64)
+    codes = ctx.prev_index  # Assuming prev_index contains grouping information
+    last_sum = {}
+    
+    for i in range(n):
+        c = codes[i]
+        if c == -1:
+            current_sum = x[i] if not np.isnan(x[i]) else 0.0
+        else:
+            prev_sum = last_sum.get(c, 0.0)
+            current_sum = prev_sum + (x[i] if not np.isnan(x[i]) else 0.0)
+        last_sum[c] = current_sum
+        out[i] = current_sum
+    
+    return out
+
+
 # def _cs_zscore(x: np.ndarray) -> np.ndarray:
 #     ctx = _FUNCTION_CONTEXT
 #     if ctx is None:
@@ -275,12 +343,67 @@ def _cs_rank_pct(x: np.ndarray) -> np.ndarray:
     denom = group_sizes[gid] + 1.0
     return (ranks + 1.0) / denom
 
+
+# Cross-sectional Median
+def _cs_median(x: np.ndarray) -> np.ndarray:
+    ctx = _FUNCTION_CONTEXT
+    if ctx is None:
+        return np.zeros_like(x, dtype=np.float64)
+    
+    gid = ctx.day_id
+    n = x.shape[0]
+    out = np.full(n, np.nan, dtype=np.float64)
+    
+# Calculate the median by group
+    unique_groups = np.unique(gid)
+    for g in unique_groups:
+        mask = gid == g
+        group_data = x[mask]
+        median = np.nanmedian(group_data)
+        out[mask] = median
+    
+    return out
+
+# Cross-sectional Extreme Ratio (Maximum/Minimum)
+def _cs_range_ratio(x: np.ndarray) -> np.ndarray:
+    ctx = _FUNCTION_CONTEXT
+    if ctx is None:
+        return np.zeros_like(x, dtype=np.float64)
+    
+    gid = ctx.day_id
+    n = x.shape[0]
+    out = np.full(n, np.nan, dtype=np.float64)
+    
+    unique_groups = np.unique(gid)
+    for g in unique_groups:
+        mask = gid == g
+        group_data = x[mask]
+        valid_data = group_data[~np.isnan(group_data)]
+        if len(valid_data) < 2:
+            ratio = 1.0          
+        else:
+            max_val = np.max(valid_data)
+            min_val = np.min(valid_data)
+            ratio = max_val / min_val if np.abs(min_val) > 1e-12 else 0.0
+        out[mask] = ratio
+    
+    return out
+
+
 # —— 注册为 Function 节点（本文件前面已有 make_function）
 ts_lag1     = make_function(function=_ts_lag1,     name="ts_lag1",     arity=1)
 ts_mean5    = make_function(function=_ts_mean5,    name="ts_mean5",    arity=1)
 ts_mean10   = make_function(function=_ts_mean10,   name="ts_mean10",   arity=1)
+ts_diff1 = make_function(function=_ts_diff1, name="ts_diff1", arity=1)
+ts_std5 = make_function(function=_ts_std5, name="ts_std5", arity=1)
+ts_std10 = make_function(function=_ts_std10, name="ts_std10", arity=1)
+ts_cumsum = make_function(function=_ts_cumsum, name="ts_cumsum", arity=1)
+
 # cs_zscore   = make_function(function=_cs_zscore,   name="cs_zscore",   arity=1)
 cs_rank_pct = make_function(function=_cs_rank_pct, name="cs_rank_pct", arity=1)
+cs_median = make_function(function=_cs_median, name="cs_median", arity=1)
+cs_range_ratio = make_function(function=_cs_range_ratio, name="cs_range_ratio", arity=1)
+
 
 # CONTEXT_AWARE_FUNCS = (ts_lag1, ts_mean5, ts_mean10, cs_zscore, cs_rank_pct)
-CONTEXT_AWARE_FUNCS = (ts_lag1, ts_mean5, ts_mean10, cs_rank_pct)
+CONTEXT_AWARE_FUNCS = (ts_lag1, ts_mean5, ts_mean10, cs_rank_pct, ts_diff1, ts_std5, ts_std10, ts_cumsum, cs_median, cs_range_ratio)

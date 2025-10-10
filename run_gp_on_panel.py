@@ -79,7 +79,11 @@ df = df.dropna(subset=feature_cols + ['ret_fwd1'])
 dates = df.index.get_level_values(0).astype(str)
 
 train_mask = pd.Series(
+<<<<<<< HEAD
     (dates >= "20150101") & (dates <= "20180601"),
+=======
+    (dates >= "20150101") & (dates <= "20190101"),
+>>>>>>> b3cef9022812d18d3435ba12c949190990cc73ee
     index=df.index
 )
 valid_mask = pd.Series(
@@ -120,6 +124,7 @@ w_train = day_uniform_weights(train_mask)
 w_valid = day_uniform_weights(valid_mask)
 w_test  = day_uniform_weights(test_mask)
 
+<<<<<<< HEAD
 # ====== 逐日(IC/RankIC) fitness（严格口径；带号均值；无绝对值无裁剪） ======
 from gplearn.fitness import make_fitness
 from scipy.stats import spearmanr, pearsonr
@@ -224,6 +229,131 @@ def _daily_mean_corr(index, y_true, y_pred, kind='rank'):
         if r is None or not np.isfinite(r): r = 0.0
         vals.append(float(r))
     return float(np.mean(vals)) if vals else 0.0
+=======
+# ====== 严格口径的逐日 IC（签名）与多空夏普 ======
+from gplearn.fitness import make_fitness
+
+def _groupby_day(index_like):
+    # index_like 是 MultiIndex: (trade_date, ts_code)
+    return pd.Index(index_like.get_level_values(0))
+
+def daily_ic_series_strict(index, y_true, y_pred,
+                           min_crosssec_n=50,
+                           uniq_ratio_th=0.05):
+    """
+    返回逐日“签名 RankIC”的 pd.Series（每个交易日都计入；不达标=0）
+    - 截面样本 < min_crosssec_n → 0
+    - 横截面唯一值比例 < uniq_ratio_th 或 横截面std≈0 → 0
+    - y 或 yhat 横截面可变性不足（唯一值<3）→ 0
+    """
+    from scipy.stats import spearmanr
+    day = _groupby_day(index)
+    df_ = (pd.DataFrame({"day": day, "y": y_true, "yhat": y_pred})
+             .replace([np.inf, -np.inf], np.nan)
+             .dropna())
+    if df_.empty:
+        return pd.Series(dtype=float)
+
+    scores = {}
+    for d, g in df_.groupby("day"):
+        score = 0.0  # 严格口径：默认 0 分
+        if len(g) >= min_crosssec_n:
+            yhat_u = g["yhat"].nunique()
+            uniq_ratio = yhat_u / len(g)
+            if (uniq_ratio >= uniq_ratio_th) and (np.nanstd(g["yhat"]) >= 1e-8) \
+               and (g["y"].nunique() >= 3) and (yhat_u >= 3):
+                ic = spearmanr(g["y"], g["yhat"]).statistic
+                if np.isfinite(ic):
+                    score = float(ic)  # 签名 IC，不取绝对值
+        scores[d] = score
+    return pd.Series(scores).sort_index()
+
+def long_short_returns(index, y_true, y_pred, q=0.2, min_n=20):
+    """逐日 Top q – Bottom q 等权多空日收益（用 y_true 当日收益）"""
+    idx_day = _groupby_day(index)
+    df_ = (pd.DataFrame({"day": idx_day, "y": y_true, "yhat": y_pred})
+             .replace([np.inf, -np.inf], np.nan)
+             .dropna())
+    if df_.empty:
+        return pd.Series(dtype=float)
+    out = {}
+    for d, g in df_.groupby("day"):
+        if len(g) < min_n or g["yhat"].nunique() < 3:
+            continue
+        top_th = g["yhat"].quantile(1 - q)
+        bot_th = g["yhat"].quantile(q)
+        long_leg  = g[g["yhat"] >= top_th]["y"]
+        short_leg = g[g["yhat"] <= bot_th]["y"]
+        if len(long_leg) < 3 or len(short_leg) < 3:
+            continue
+        out[d] = float(long_leg.mean() - short_leg.mean())
+    return pd.Series(out).sort_index()
+
+def sharpe_of_series(ret_series, ann_factor=252):
+    if ret_series is None or len(ret_series) < 5:
+        return np.nan
+    mu = ret_series.mean()
+    sd = ret_series.std(ddof=1)
+    if not np.isfinite(sd) or sd <= 0:
+        return np.nan
+    return float((mu / sd) * np.sqrt(ann_factor))
+
+# ====== 训练用 fitness（签名IC均值；退化=0） ======
+_train_index_for_metric = None
+def set_train_index_for_metric(mi):
+    """在 fit 前设置（MultiIndex: (trade_date, ts_code)）"""
+    global _train_index_for_metric
+    _train_index_for_metric = mi
+
+def _fitness_daily_ic_signed_strict_zero_if_degen(y_true, y_pred, sample_weight):
+    """
+    目标：训练区间“逐日签名 RankIC 的均值”（严格口径，每日都计入；不达标=0）
+    退化即 0 分：
+      - 全局 std(y_pred) < 1e-8 （整体近常数）
+      - “0 分的交易日”占比 > 50%（绝大多数日没法区分） → 0
+      - 全部交易日都 0 → 0
+    注：不做任何单日 IC 裁剪；不取绝对值。
+    """
+    import numpy as np, pandas as pd
+    if _train_index_for_metric is None:
+        return 0.0
+
+    sub = (pd.DataFrame({"y": y_true, "yhat": y_pred}, index=_train_index_for_metric)
+             .replace([np.inf, -np.inf], np.nan)
+             .dropna())
+    if sub.empty:
+        return 0.0
+
+    # 整体近常数 → 0
+    if float(np.nanstd(sub["yhat"].values)) < 1e-8:
+        return 0.0
+
+    # # 严格口径逐日 IC（签名）
+    # s_ic = daily_ic_series_strict(
+    #     _train_index_for_metric, sub["y"].values, sub["yhat"].values,
+    #     min_crosssec_n=50, uniq_ratio_th=0.05
+    # )
+    # 改为（传“dropna 后”的索引，长度和 y/yhat 完全一致）：
+    s_ic = daily_ic_series_strict(
+        sub.index, sub["y"].values, sub["yhat"].values,
+        min_crosssec_n=50, uniq_ratio_th=0.05
+    )
+
+    if s_ic.empty:
+        return 0.0
+
+    zero_ratio = float((np.abs(s_ic.values) < 1e-12).mean())
+    if zero_ratio > 0.5:
+        return 0.0
+
+    mean_ic = float(np.mean(s_ic.values))  # 带号均值
+    # fitness 最小为 0，避免负值扰动进化（负方向会被 'neg' 算子自己翻转）
+    return max(mean_ic, 0.0)
+
+fitness_signed_strict = make_fitness(function=_fitness_daily_ic_signed_strict_zero_if_degen,
+                                     greater_is_better=True)
+
+>>>>>>> b3cef9022812d18d3435ba12c949190990cc73ee
 
 
 func_set = (
@@ -232,36 +362,86 @@ func_set = (
 )
 
 # ===================== 配置 & 训练 GP（以 Spearman/IC 为目标） =====================
+<<<<<<< HEAD
 
 # 在创建 SymbolicRegressor 之前
+=======
+# est = SymbolicRegressor(
+#     population_size=1000,
+#     generations=2,
+#     tournament_size=40,
+#     function_set=func_set,
+#     metric='pearson',
+#     parsimony_coefficient='auto',
+#     p_crossover=0.85,
+#     p_subtree_mutation=0.06,
+#     p_hoist_mutation=0.02,
+#     p_point_mutation=0.05,
+#     max_samples=1.0,   # 必须（保证截面完整）
+#     n_jobs=1,          # 必须（上下文为进程内全局）
+#     random_state=37,
+#     verbose=1,
+#     stopping_criteria=0.2
+# )
+
+# # 训练
+# est.set_context_index(df.loc[train_mask].index)
+# est.fit(X_train, y_train, sample_weight=w_train)
+
+
+# est.fit(X_train, y_train, sample_weight=w_train)
+
+# 在创建 SymbolicRegressor 之前：把训练期的 MultiIndex 交给 fitness
+>>>>>>> b3cef9022812d18d3435ba12c949190990cc73ee
 set_train_index_for_metric(df.loc[train_mask].index)
 
 est = SymbolicRegressor(
     population_size=1000,
     generations=2,
+<<<<<<< HEAD
     tournament_size=20,
     function_set=func_set,
     metric=fitness_gp,            # ← 使用新的 IC/RankIC fitness
+=======
+    tournament_size=40,
+    function_set=func_set,              # 不删任何算子
+    metric=fitness_signed_strict,       # ← 用“签名IC均值，退化=0”的严格口径
+>>>>>>> b3cef9022812d18d3435ba12c949190990cc73ee
     parsimony_coefficient='auto',
     # parsimony_coefficient=0.01,
     p_crossover=0.4,
     p_subtree_mutation=0.01,
     p_hoist_mutation=0.02,
+<<<<<<< HEAD
     p_point_mutation=0.01,
     p_point_replace = 0.4,
     max_samples=1.0,
     n_jobs=1,                     # 为了上下文一致性必须=1
     random_state=24,
+=======
+    p_point_mutation=0.05,
+    max_samples=1.0,                    # 保持完整截面
+    n_jobs=1,                           # 必须（上下文是进程内全局）
+    random_state=37,
+>>>>>>> b3cef9022812d18d3435ba12c949190990cc73ee
     verbose=1,
     stopping_criteria=0.20
 )
 
+<<<<<<< HEAD
 
 # 训练前设置“训练期”的函数上下文（你已有）
+=======
+# 训练前设置“训练期”的函数上下文（你已有这行）
+>>>>>>> b3cef9022812d18d3435ba12c949190990cc73ee
 est.set_context_index(df.loc[train_mask].index)
 est.fit(X_train, y_train, sample_weight=w_train)
 
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> b3cef9022812d18d3435ba12c949190990cc73ee
 # ===================== Factor Zoo：输出前10名程序（按 fitness_ 排序） =====================
 def get_topk_programs(est, topk=10):
     """
@@ -414,6 +594,7 @@ yhat_valid = est.predict(X_valid)
 est.set_context_index(df.loc[test_mask].index)
 yhat_test  = est.predict(X_test)
 
+<<<<<<< HEAD
 print("\n# ==== Overall (on current best) ====")
 print(f"RankIC  VALID={_daily_mean_corr(df.loc[valid_mask].index, y_valid, yhat_valid, 'rank'):+.4f}   "
       f"TEST={_daily_mean_corr(df.loc[test_mask].index,  y_test,  yhat_test,  'rank'):+.4f}")
@@ -438,6 +619,68 @@ for i, p in enumerate(topk_programs, 1):
     ic_t  = _daily_mean_corr(test_index,  y_test,  yt, kind='pearson')
 
     print(f"#{i:02d}  RankIC[V,T]={ric_v:+.4f}, {ric_t:+.4f}   IC[V,T]={ic_v:+.4f}, {ic_t:+.4f}   :: {p}")
+=======
+# def _ic_for_programs(programs, X_valid, y_valid, X_test, y_test,
+#                      index_valid, index_test):
+#     print("\n[Top 10 Factors: VALID/TEST IC]")
+#     for i, p in enumerate(programs, 1):
+#         # —— VALID：先设验证集上下文，再执行
+#         set_function_context(build_context_from_index(index_valid))
+#         yv = p.execute(X_valid)
+#         icv = ic_spearman(y_valid, yv)
+
+#         # —— TEST：切到测试集上下文，再执行
+#         set_function_context(build_context_from_index(index_test))
+#         yt = p.execute(X_test)
+#         ict = ic_spearman(y_test, yt)
+
+#         print(f"#{i:02d}  VALID_IC={icv:.4f}  TEST_IC={ict:.4f}")
+
+# _ic_for_programs(
+#     topk_programs,
+#     X_valid, y_valid,
+#     X_test,  y_test,
+#     df.loc[valid_mask].index,
+#     df.loc[test_mask].index
+# )
+def report_programs(programs, X_v, y_v, idx_v, X_t, y_t, idx_t, topn=10, ann_factor=252):
+    print("\n[Top Programs: VALID / TEST metrics]")
+    for i, p in enumerate(programs[:topn], 1):
+        # VALID
+        set_function_context(build_context_from_index(idx_v))
+        yhat_v = p.execute(X_v)
+        s_v = daily_ic_series_strict(idx_v, y_v, yhat_v,
+                                     min_crosssec_n=50, uniq_ratio_th=0.05)
+        ic_v = float(np.mean(s_v.values)) if len(s_v) else float("nan")
+        zero_rt_v = float((np.abs(s_v.values) < 1e-12).mean()) if len(s_v) else float("nan")
+        ret_v = long_short_returns(idx_v, y_v, yhat_v, q=0.2, min_n=20)
+        sharpe_v = sharpe_of_series(ret_v, ann_factor=ann_factor)
+
+        # TEST
+        set_function_context(build_context_from_index(idx_t))
+        yhat_t = p.execute(X_t)
+        s_t = daily_ic_series_strict(idx_t, y_t, yhat_t,
+                                     min_crosssec_n=50, uniq_ratio_th=0.05)
+        ic_t = float(np.mean(s_t.values)) if len(s_t) else float("nan")
+        zero_rt_t = float((np.abs(s_t.values) < 1e-12).mean()) if len(s_t) else float("nan")
+        ret_t = long_short_returns(idx_t, y_t, yhat_t, q=0.2, min_n=20)
+        sharpe_t = sharpe_of_series(ret_t, ann_factor=ann_factor)
+
+        print(
+          f"#{i:02d}  VALID: IC={ic_v:+.4f}  Sharpe={sharpe_v:+.2f}  [零分日占比={zero_rt_v:.2f}]"
+          f"   ||   TEST: IC={ic_t:+.4f}  Sharpe={sharpe_t:+.2f}  [零分日占比={zero_rt_t:.2f}]"
+        )
+
+# 调用（替换你原来的逐因子打印）
+report_programs(
+    topk_programs,
+    X_valid, y_valid, df.loc[valid_mask].index,
+    X_test,  y_test,  df.loc[test_mask].index,
+    topn=10, ann_factor=252
+)
+>>>>>>> b3cef9022812d18d3435ba12c949190990cc73ee
+
+
 
 
 

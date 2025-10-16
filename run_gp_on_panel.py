@@ -27,7 +27,7 @@ df = df.sort_index()
 
 # 目标：下二十日收益 ret_fwd1
 close = df['close'].unstack('ts_code').sort_index()
-ret_fwd1 = (close.shift(-2) / close - 1.0).stack().rename('ret_fwd1')
+ret_fwd1 = (close.shift(-20) / close - 1.0).stack().rename('ret_fwd1')
 df = df.join(ret_fwd1, how='left').dropna(subset=['ret_fwd1'])
 
 # 可选稳健化：裁剪极端收益，防止极少数异常影响训练
@@ -79,7 +79,7 @@ df = df.dropna(subset=feature_cols + ['ret_fwd1'])
 dates = df.index.get_level_values(0).astype(str)
 
 train_mask = pd.Series(
-    (dates >= "20150101") & (dates <= "20180601"),
+    (dates >= "20170101") & (dates <= "20180601"),
     index=df.index
 )
 valid_mask = pd.Series(
@@ -87,7 +87,7 @@ valid_mask = pd.Series(
     index=df.index
 )
 test_mask = pd.Series(
-    (dates >= "20200320") & (dates <= "20210320"),
+    (dates >= "20200420") & (dates <= "20210320"),
     index=df.index
 )
 
@@ -100,7 +100,7 @@ _check_nonempty("valid", valid_mask)
 _check_nonempty("test",  test_mask)
 
 # 取矩阵
-X_train = df.loc[train_mask, feature_cols].values
+X_train = df.loc[train_mask, feature_cols].values # 提取为numpy数组
 y_train = df.loc[train_mask, 'ret_fwd1'].values
 X_valid = df.loc[valid_mask, feature_cols].values
 y_valid = df.loc[valid_mask, 'ret_fwd1'].values
@@ -149,6 +149,7 @@ def _fitness_daily_corr_numpy(y_true, y_pred, sample_weight):
     """
     严格口径：逐日计算 RankIC(或IC)；不满足条件的当日记 0；最后取“带号均值”。
     退化直接 0：整体std≈0；或>50%交易日记0。
+    新增：每个截面进行中位数去极值和标准化。
     """
     import numpy as np
     if _train_groups is None:
@@ -162,23 +163,38 @@ def _fitness_daily_corr_numpy(y_true, y_pred, sample_weight):
 
     scores = []
     zero_days = 0
-    for (s, t) in _train_groups:
-        yy = y[s:t]; hh = h[s:t]
+    for (s, t) in _train_groups: # 遍历每个交易日
+        yy = y[s:t]; hh = h[s:t]  # T+20期的收益率，T期的因子值
         m = np.isfinite(yy) & np.isfinite(hh)
         if m.sum() < 50:  # 最少截面样本
             scores.append(0.0); zero_days += 1; continue
         yy = yy[m]; hh = hh[m]
+        # 新增：中位数去极值 (MAD方法)
+        fm = np.median(hh)  # 中位数
+        mad = np.median(np.abs(hh - fm))  # |Ft - FM|的中位数
+        if mad > 0:
+            # 将 > FM + 5*MAD 的值设为 FM + 5*MAD
+            # 将 < FM - 5*MAD 的值设为 FM - 5*MAD
+            hh_processed = np.clip(hh, fm - 5*mad, fm + 5*mad)
+        else:
+            hh_processed = hh.copy()
+        
+        # 新增：标准化，将去极值后的因子值标准化为均值0、标准差1
+        hh_std = (hh_processed - np.mean(hh_processed)) / (np.std(hh_processed) + 1e-9)
 
-        nunq = len(np.unique(hh))
-        uniq_ratio = nunq / len(hh)
+        nunq = len(np.unique(hh_std))  # 使用标准化后的因子值
+        uniq_ratio = nunq / len(hh_std)
+
+        # nunq = len(np.unique(hh))
+        # uniq_ratio = nunq / len(hh)
         # 横截面退化：预测几乎无区分度；或真实/预测唯一值太少
-        if uniq_ratio < 0.05 or np.nanstd(hh) < 1e-8 or len(np.unique(yy)) < 3 or nunq < 3:
+        if uniq_ratio < 0.05 or np.nanstd(hh_std) < 1e-8 or len(np.unique(yy)) < 3 or nunq < 3:
             scores.append(0.0); zero_days += 1; continue
 
         if FITNESS_KIND == 'rank':
-            r = spearmanr(yy, hh).statistic
+            r = spearmanr(yy, hh_std).statistic
         else:  # 'pearson'
-            r = pearsonr(yy, hh).statistic
+            r = pearsonr(yy, hh_std).statistic
         if r is None or not np.isfinite(r):
             r = 0.0; zero_days += 1
         scores.append(float(r))
@@ -214,13 +230,24 @@ def _daily_mean_corr(index, y_true, y_pred, kind='rank'):
         if m.sum() < 50:
             vals.append(0.0); continue
         yy = yy[m]; hh = hh[m]
-        nunq = len(np.unique(hh)); uniq_ratio = nunq / len(hh)
-        if uniq_ratio < 0.05 or np.nanstd(hh) < 1e-8 or len(np.unique(yy)) < 3 or nunq < 3:
+        # 新增：中位数去极值 (MAD方法) - 与fitness函数保持一致
+        fm = np.median(hh)  # 中位数
+        mad = np.median(np.abs(hh - fm))  # |Ft - FM|的中位数
+        if mad > 0:
+            hh_processed = np.clip(hh, fm - 5*mad, fm + 5*mad)
+        else:
+            hh_processed = hh.copy()
+        
+        # 新增：标准化 - 与fitness函数保持一致
+        hh_std = (hh_processed - np.mean(hh_processed)) / (np.std(hh_processed) + 1e-9)
+
+        nunq = len(np.unique(hh_std)); uniq_ratio = nunq / len(hh_std)  # 使用标准化后的因子值
+        if uniq_ratio < 0.05 or np.nanstd(hh_std) < 1e-8 or len(np.unique(yy)) < 3 or nunq < 3:
             vals.append(0.0); continue
         if kind == 'rank':
-            r = spearmanr(yy, hh).statistic
+            r = spearmanr(yy, hh_std).statistic # 使用标准化后的因子值
         else:
-            r = pearsonr(yy, hh).statistic
+            r = pearsonr(yy, hh_std).statistic # 使用标准化后的因子值
         if r is None or not np.isfinite(r): r = 0.0
         vals.append(float(r))
     return float(np.mean(vals)) if vals else 0.0
@@ -234,7 +261,7 @@ func_set = (
 # ===================== 配置 & 训练 GP（以 Spearman/IC 为目标） =====================
 
 # 在创建 SymbolicRegressor 之前
-set_train_index_for_metric(df.loc[train_mask].index)
+set_train_index_for_metric(df.loc[train_mask].index) # 基于原始DataFrame索引
 
 est = SymbolicRegressor(
     population_size=1000,
@@ -441,7 +468,7 @@ for i, p in enumerate(topk_programs, 1):
 
 
 
-
+# 最优因子的表现
 def daily_ic_mean(mask: pd.Series, yhat: np.ndarray) -> float:
     sub = df.loc[mask, :].copy()
     sub['y'] = sub['ret_fwd1'].values
@@ -450,7 +477,22 @@ def daily_ic_mean(mask: pd.Series, yhat: np.ndarray) -> float:
     n_days = sub.index.get_level_values(0).nunique()
     for _, g in tqdm(sub.groupby(level=0), total=n_days, desc="Compute daily IC"):
         if g['y'].nunique() > 1 and g['yhat'].nunique() > 1:
-            out.append(spearmanr(g['y'], g['yhat']).statistic)
+            # 对每个截面的因子值进行去极值和标准化
+            y_vals = g['y'].values
+            h_vals = g['yhat'].values
+            
+            # 中位数去极值 (MAD方法)
+            fm = np.median(h_vals)
+            mad = np.median(np.abs(h_vals - fm))
+            if mad > 0:
+                h_processed = np.clip(h_vals, fm - 5*mad, fm + 5*mad)
+            else:
+                h_processed = h_vals.copy()
+            
+            # 标准化
+            h_std = (h_processed - np.mean(h_processed)) / (np.std(h_processed) + 1e-9)
+            
+            out.append(spearmanr(y_vals, h_std).statistic)  # 使用标准化后的因子值
     return float(np.nanmean(out)) if out else 0.0
 
 print(f"[VALID] Daily IC mean = {daily_ic_mean(valid_mask, yhat_valid):.4f}")

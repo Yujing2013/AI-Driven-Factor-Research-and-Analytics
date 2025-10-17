@@ -25,7 +25,7 @@ PANEL_PARQUET = "/Users/astrologer/Desktop/a_share_pv_clean_2015_2025_trimmed.pa
 df = pd.read_parquet(PANEL_PARQUET)  # MultiIndex: (trade_date, ts_code)
 df = df.sort_index()
 
-# 目标：下二十日收益 ret_fwd1
+# 目标：下2日收益 ret_fwd1
 close = df['close'].unstack('ts_code').sort_index()
 ret_fwd1 = (close.shift(-20) / close - 1.0).stack().rename('ret_fwd1')
 df = df.join(ret_fwd1, how='left').dropna(subset=['ret_fwd1'])
@@ -164,7 +164,7 @@ def _fitness_daily_corr_numpy(y_true, y_pred, sample_weight):
     scores = []
     zero_days = 0
     for (s, t) in _train_groups: # 遍历每个交易日
-        yy = y[s:t]; hh = h[s:t]  # T+20期的收益率，T期的因子值
+        yy = y[s:t]; hh = h[s:t]  # T+2期的收益率，T期的因子值
         m = np.isfinite(yy) & np.isfinite(hh)
         if m.sum() < 50:  # 最少截面样本
             scores.append(0.0); zero_days += 1; continue
@@ -265,7 +265,8 @@ set_train_index_for_metric(df.loc[train_mask].index) # 基于原始DataFrame索�
 
 est = SymbolicRegressor(
     population_size=1000,
-    generations=2,
+    generations=3,
+    init_depth=(1, 4),  # 新增：设置树深度范围
     tournament_size=20,
     function_set=func_set,
     metric=fitness_gp,            # ← 使用新的 IC/RankIC fitness
@@ -273,14 +274,16 @@ est = SymbolicRegressor(
     # parsimony_coefficient=0.01,
     p_crossover=0.4,
     p_subtree_mutation=0.01,
-    p_hoist_mutation=0.02,
+    p_hoist_mutation=0, # 从0.02改为0
     p_point_mutation=0.01,
     p_point_replace = 0.4,
     max_samples=1.0,
     n_jobs=1,                     # 为了上下文一致性必须=1
     random_state=24,
     verbose=1,
-    stopping_criteria=0.20
+    stopping_criteria=0.20,
+    feature_names=feature_cols,  # 特征变成有意义的名字
+    const_range=None #禁用常数生成
 )
 
 

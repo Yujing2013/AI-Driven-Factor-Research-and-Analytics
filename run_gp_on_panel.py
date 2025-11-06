@@ -36,7 +36,7 @@ df = pd.read_parquet(PANEL_PARQUET).sort_index()
 
 # 目标值 = 未来两天的相对收益（避免过强噪声，后续会做裁剪）
 close = df['close'].unstack('ts_code').sort_index()
-ret_fwd1 = (close.shift(-2) / close - 1.0).stack().rename('ret_fwd1')
+ret_fwd1 = (close.shift(-3) / close.shift(-1) - 1.0).stack().rename('ret_fwd1')
 df = df.join(ret_fwd1, how='left').dropna(subset=['ret_fwd1'])
 
 # 对异常收益做轻剪裁，减少极端值对训练的破坏
@@ -95,8 +95,8 @@ df = df.dropna(subset=feature_cols + ['ret_fwd1'])
 # 说明：日期范围可按需更改；mask 的索引需与 df 完全对齐
 dates = df.index.get_level_values(0).astype(str)
 
-train_mask = pd.Series((dates >= "20170101") & (dates <= "20170601"), index=df.index)
-valid_mask = pd.Series((dates >= "20190302") & (dates <= "20190602"), index=df.index)
+train_mask = pd.Series((dates >= "20170101") & (dates <= "20170201"), index=df.index)
+valid_mask = pd.Series((dates >= "20190302") & (dates <= "20190502"), index=df.index)
 test_mask  = pd.Series((dates >= "20200420") & (dates <= "20200620"), index=df.index)
 
 # 简单的非空保证（不用 try/except；直接断言）
@@ -449,19 +449,19 @@ train_index = df.loc[train_mask].index
 set_train_index_for_metric(train_index)  # 预设训练期“逐日片段”
 
 est = SymbolicRegressor(
-    population_size=600,
+    population_size=700,
     generations=3,
     init_depth=(2, 5),
-    tournament_size=20,
+    tournament_size=8,
     function_set=func_set,
     metric=fitness_gp,
-    parsimony_coefficient='auto',
-    p_crossover=0.5,
-    p_subtree_mutation=0.05,
-    p_hoist_mutation=0.0,
-    p_point_mutation=0.04,
-    p_point_replace=0.2,
-    max_samples=0.7,
+    parsimony_coefficient=0.002,
+    p_crossover=0.55,
+    p_subtree_mutation=0.08,
+    p_hoist_mutation=0.08,  # 增加hoist mutation，控制bloat
+    p_point_mutation=0.06,
+    p_point_replace=0.25,
+    max_samples=0.8,
     n_jobs=1,                # 为与上下文兼容，保持单线程
     random_state=24,
     verbose=1,
